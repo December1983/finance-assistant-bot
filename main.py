@@ -293,7 +293,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 2) Можно показать, что распознали (удобно для контроля)
-    await update.message.reply_text(f"🗣️ Распознал: {text}")
+    # await update.message.reply_text(f"🗣️ Распознал: {text}")
 
     # 3) Дальше — тот же поток, что и для текста
     await process_user_text(update, context, text)
