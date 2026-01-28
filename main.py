@@ -5,10 +5,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Telegram
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Firebase
 firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 cred = credentials.Certificate(json.loads(firebase_json))
 firebase_admin.initialize_app(cred)
@@ -32,5 +30,4 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 
 print("Bot started")
-
 app.run_polling()
