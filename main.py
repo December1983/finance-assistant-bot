@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -114,6 +115,106 @@ def call_llm_advice(user_id: int, user_text: str) -> str:
     return answer.strip()
 
 # -----------------------------
+# Memory summary (auto)
+# -----------------------------
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def build_summary_instructions() -> str:
+    return (
+        "Ты пишешь краткое финансовое досье пользователя (memory summary) на русском языке.\n"
+        "Требования:\n"
+        "- Коротко, 6–10 строк, без воды.\n"
+        "- Без морали, без угроз.\n"
+        "- Не выдумывай цифры: если нет точных чисел, пиши 'примерно/неизвестно'.\n"
+        "- Формат строго такой:\n"
+        "ПРОФИЛЬ:\n"
+        "- Доход: ...\n"
+        "- Обязательства: ...\n"
+        "- Баланс: ...\n"
+        "- Цель: ...\n"
+        "- Риски: ...\n"
+        "- Что делать дальше (1–2 пункта): ...\n"
+        "- Последний запрос: ...\n"
+        "- Последний совет: ...\n"
+    )
+
+def call_llm_memory_summary(user_id: int, last_user_text: str, last_bot_text: str) -> str:
+    context_text = build_context_text(user_id)
+
+    # Подтягиваем старое саммари (если есть), чтобы модель "переписала" аккуратно, а не ломала
+    udoc = user_ref(user_id).get()
+    old_summary = ""
+    if udoc.exists:
+        d = udoc.to_dict() or {}
+        ms = (d.get("memory_summary") or {}).get("text", "")
+        old_summary = ms or ""
+
+    instructions = build_summary_instructions()
+    input_text = (
+        f"ТЕКУЩИЙ КОНТЕКСТ:\n{context_text}\n\n"
+        f"ПРЕДЫДУЩЕЕ САММАРИ (может быть пусто):\n{old_summary}\n\n"
+        f"ПОСЛЕДНИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{last_user_text}\n\n"
+        f"ПОСЛЕДНИЙ ОТВЕТ АССИСТЕНТА:\n{last_bot_text}\n\n"
+        "Сгенерируй обновлённое саммари строго в заданном формате."
+    )
+
+    resp = openai_client.responses.create(
+        model="gpt-4o-mini",
+        instructions=instructions,
+        input=input_text,
+    )
+
+    text = getattr(resp, "output_text", None)
+    return (text or "").strip()
+
+def maybe_update_memory_summary(user_id: int, last_user_text: str, last_bot_text: str):
+    """
+    Обновляем memory summary не на каждый запрос, чтобы не тратить деньги.
+    Правило MVP: обновлять раз в 5 сообщений после онбординга.
+    """
+    ref = user_ref(user_id)
+    doc = ref.get()
+    if not doc.exists:
+        return
+
+    data = doc.to_dict() or {}
+    onboarding = data.get("onboarding", {}) or {}
+    if not onboarding.get("done", False):
+        return  # пока идёт онбординг — саммари не нужно
+
+    counters = data.get("counters", {}) or {}
+    n = int(counters.get("since_summary", 0)) + 1
+
+    # всегда сохраняем последние тексты (это бесплатно, в Firestore)
+    ref.set({
+        "last_interaction": {
+            "user_text": last_user_text[:1500],
+            "bot_text": last_bot_text[:1500],
+            "at": firestore.SERVER_TIMESTAMP,
+        },
+        "counters": {"since_summary": n},
+    }, merge=True)
+
+    # обновляем саммари только раз в 5 сообщений
+    if n < 5:
+        return
+
+    try:
+        summary = call_llm_memory_summary(user_id, last_user_text, last_bot_text)
+        if summary:
+            ref.set({
+                "memory_summary": {
+                    "text": summary[:3000],
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                "counters": {"since_summary": 0},
+            }, merge=True)
+    except Exception as e:
+        # Не мешаем пользователю, просто лог
+        print("MEMORY_SUMMARY error:", repr(e))
+
+# -----------------------------
 # Speech-to-text (voice -> text)
 # -----------------------------
 async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -126,8 +227,6 @@ async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAUL
 
     tg_file = await context.bot.get_file(file_id)
 
-    # Telegram voice обычно ogg/opus — OpenAI принимает ogg (и другие форматы)
-    # https://platform.openai.com/docs/guides/speech-to-text
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         tmp_path = tmp.name
 
@@ -140,7 +239,6 @@ async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAUL
                 file=f,
             )
 
-        # В SDK обычно это tr.text, но на всякий случай сделаем fallback
         text = getattr(tr, "text", None)
         if not text:
             text = str(tr)
@@ -220,6 +318,15 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await update.message.reply_text(
                 "Ок, я понял общую картину. Теперь можешь спрашивать что угодно по деньгам."
             )
+
+            # после завершения онбординга — сразу создадим стартовое саммари (1 раз)
+            try:
+                # считаем, что "последний запрос" = goal, "последний совет" = системная фраза
+                last_bot = "Онбординг завершён. Готов отвечать по деньгам."
+                maybe_update_memory_summary(user.id, f"(онбординг) Цель: {text}", last_bot)
+            except Exception as e:
+                print("MEMORY init error:", repr(e))
+
             return
 
         # fallback
@@ -233,6 +340,10 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     try:
         answer = call_llm_advice(user.id, text)
         await update.message.reply_text(answer)
+
+        # обновляем memory summary (раз в 5 сообщений)
+        maybe_update_memory_summary(user.id, text, answer)
+
     except Exception as e:
         await update.message.reply_text("Ошибка при обработке запроса. Попробуй ещё раз чуть позже.")
         print("LLM error:", repr(e))
@@ -259,6 +370,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "allow_weekly_nudge": True,
             },
             "memory_summary": {"text": "Пока нет данных.", "updated_at": firestore.SERVER_TIMESTAMP},
+            "counters": {"since_summary": 0},
         })
 
         await update.message.reply_text("Привет. Давай разберём твою финансовую ситуацию.")
@@ -292,10 +404,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не разобрал голос (пусто). Попробуй ещё раз.")
         return
 
-    # 2) Можно показать, что распознали (удобно для контроля)
-    # await update.message.reply_text(f"🗣️ Распознал: {text}")
-
-    # 3) Дальше — тот же поток, что и для текста
+    # 2) Никаких "Распознал: ..." — сразу в основной поток
     await process_user_text(update, context, text)
 
 # -----------------------------
