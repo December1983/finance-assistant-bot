@@ -1,4 +1,3 @@
-# main/main.py
 import os
 import json
 import tempfile
@@ -86,11 +85,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     storage.ensure_user(user)
     await update.message.reply_text(
-        "Я финансовый блокнот.\n"
-        "Говори или пиши как обычно:\n"
+        "Я финансовая записная книжка.\n"
+        "Говори/пиши как обычно:\n"
         "• «кофе 5»\n"
         "• «пришло 450»\n"
         "• «покажи за неделю»\n"
+        "• «покажи за неделю бензин»\n"
         "• «удали всё»"
     )
 
@@ -113,7 +113,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не разобрал голос (пусто). Попробуй ещё раз.")
         return
 
-    # ВАЖНО: мы НЕ выводим “распознал: ...” — ты это просил убрать
+    # НЕ выводим “распознал: ...”
     reply, _ = await brain.handle(user, text)
     await update.message.reply_text(reply)
 
