@@ -42,9 +42,9 @@ storage = Storage(db)
 brain = Brain(storage)
 
 # -----------------------------
-# OpenAI init (voice->text)
+# OpenAI init (voice->text only here)
 # -----------------------------
-openai_client = OpenAI()  # берет OPENAI_API_KEY из ENV автоматически
+openai_client = OpenAI()  # OPENAI_API_KEY из ENV
 
 
 # -----------------------------
@@ -59,18 +59,15 @@ async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAUL
 
     try:
         await tg_file.download_to_drive(custom_path=tmp_path)
-
         with open(tmp_path, "rb") as f:
             tr = openai_client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=f,
             )
-
         text = getattr(tr, "text", None)
         if not text:
             text = str(tr)
         return (text or "").strip()
-
     finally:
         try:
             os.remove(tmp_path)
@@ -84,37 +81,38 @@ async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAUL
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     storage.ensure_user(user)
+
+    # Никаких меню. Просто коротко объясняем.
+    # Язык определится автоматически при первом реальном сообщении (auto),
+    # но базовую валюту спросим.
     await update.message.reply_text(
-        "Я финансовая записная книжка.\n"
-        "Говори/пиши как обычно:\n"
-        "• «кофе 5»\n"
-        "• «пришло 450»\n"
-        "• «покажи за неделю»\n"
-        "• «покажи за неделю бензин»\n"
-        "• «удали всё»"
+        "Hi! I'm your finance notebook.\n"
+        "Just text or speak normally: “coffee 5”, “got paid 1200”, “my expenses last week”.\n"
+        "First question: what base currency do you want for all summaries? (e.g., USD, EUR, GBP)"
     )
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text or ""
-    reply, _ = await brain.handle(user, text)
+    reply = await brain.handle_message(user, text)
     await update.message.reply_text(reply)
+
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     try:
         text = await transcribe_telegram_voice(update, context)
     except Exception as e:
-        await update.message.reply_text("Не смог распознать голос. Попробуй ещё раз.")
+        await update.message.reply_text("I couldn't transcribe the voice message. Please try again.")
         print("STT error:", repr(e))
         return
 
     if not text:
-        await update.message.reply_text("Не разобрал голос (пусто). Попробуй ещё раз.")
+        await update.message.reply_text("I couldn't hear anything clearly. Please try again.")
         return
 
-    # НЕ выводим “распознал: ...”
-    reply, _ = await brain.handle(user, text)
+    reply = await brain.handle_message(user, text)
     await update.message.reply_text(reply)
 
 
