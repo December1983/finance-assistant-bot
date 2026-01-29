@@ -1,30 +1,31 @@
-# main/storage.py
 from __future__ import annotations
 
-from datetime import datetime, date, time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from firebase_admin import firestore
-
-
-def _day_bounds(d: date) -> Tuple[datetime, datetime]:
-    start = datetime.combine(d, time(0, 0, 0))
-    end = datetime.combine(d, time(23, 59, 59))
-    return start, end
 
 
 class Storage:
     def __init__(self, db):
         self.db = db
 
-    # --------------- Refs ---------------
+    # -----------------------------
+    # refs
+    # -----------------------------
     def user_ref(self, user_id: int):
         return self.db.collection("users").document(str(user_id))
 
     def tx_col(self, user_id: int):
         return self.user_ref(user_id).collection("transactions")
 
-    # --------------- User init ---------------
+    # cooldown survives account deletion
+    def delete_cooldown_ref(self, user_id: int):
+        return self.db.collection("deletion_cooldowns").document(str(user_id))
+
+    # -----------------------------
+    # user
+    # -----------------------------
     def ensure_user(self, user: Any) -> None:
         ref = self.user_ref(user.id)
         doc = ref.get()
@@ -32,76 +33,88 @@ class Storage:
             ref.set({"last_active_at": firestore.SERVER_TIMESTAMP}, merge=True)
             return
 
-        ref.set({
-            "telegram_id": user.id,
-            "username": getattr(user, "username", None),
-            "first_name": getattr(user, "first_name", None),
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "last_active_at": firestore.SERVER_TIMESTAMP,
-            "settings": {
-                "currency": "USD",
-                "timezone": "America/Los_Angeles",
+        ref.set(
+            {
+                "telegram_id": user.id,
+                "username": getattr(user, "username", None),
+                "first_name": getattr(user, "first_name", None),
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "last_active_at": firestore.SERVER_TIMESTAMP,
+                "settings": {
+                    "language_mode": "auto",      # auto or fixed
+                    "language_fixed": None,       # e.g. "de"
+                    "base_currency": None,        # e.g. "USD" (asked on start)
+                    "timezone": "America/Los_Angeles",
+                },
+                "pending": None,                 # confirmations
             },
-            "pending": None,  # тут будем хранить незавершённый вопрос-уточнение
-        }, merge=True)
+            merge=True,
+        )
 
-    # --------------- Pending clarification ---------------
-    def set_pending(self, user_id: int, pending: Optional[Dict[str, Any]]) -> None:
-        self.user_ref(user_id).set({"pending": pending}, merge=True)
+    def get_user_settings(self, user_id: int) -> Dict[str, Any]:
+        doc = self.user_ref(user_id).get()
+        if not doc.exists:
+            return {}
+        data = doc.to_dict() or {}
+        return data.get("settings", {}) or {}
+
+    def set_language_fixed(self, user_id: int, lang: Optional[str], mode: str) -> None:
+        self.user_ref(user_id).set(
+            {"settings": {"language_mode": mode, "language_fixed": lang}},
+            merge=True,
+        )
+
+    def set_base_currency(self, user_id: int, cur: str) -> None:
+        self.user_ref(user_id).set({"settings": {"base_currency": cur}}, merge=True)
 
     def get_pending(self, user_id: int) -> Optional[Dict[str, Any]]:
         doc = self.user_ref(user_id).get()
         if not doc.exists:
             return None
-        data = doc.to_dict() or {}
-        return data.get("pending")
+        return (doc.to_dict() or {}).get("pending")
 
-    # --------------- Transactions ---------------
-    def add_transaction(self, user_id: int, tx: Dict[str, Any]) -> str:
-        """
-        tx fields expected:
-          type: 'expense'|'income'
-          amount: float
-          currency: 'USD'
-          category: str
-          note: str
-        """
+    def set_pending(self, user_id: int, pending: Optional[Dict[str, Any]]) -> None:
+        self.user_ref(user_id).set({"pending": pending}, merge=True)
+
+    # -----------------------------
+    # transactions
+    # -----------------------------
+    def add_transaction(self, user_id: int, payload: Dict[str, Any]) -> str:
         ref = self.tx_col(user_id).document()
-        payload = dict(tx)
-        payload.update({
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "ts": firestore.SERVER_TIMESTAMP,  # для сортировки/диапазонов
-        })
-        ref.set(payload)
-        # запомним последнюю запись (на будущее: undo/edit last)
-        self.user_ref(user_id).set({"last_transaction_id": ref.id}, merge=True)
+        data = dict(payload)
+        data["created_at"] = firestore.SERVER_TIMESTAMP
+        data["ts"] = firestore.SERVER_TIMESTAMP
+        ref.set(data)
+        self.user_ref(user_id).set({"last_active_at": firestore.SERVER_TIMESTAMP}, merge=True)
         return ref.id
 
-    def delete_all_user_data(self, user_id: int) -> None:
-        """
-        Полная очистка: удаляем все транзакции и сам документ user.
-        Firestore не умеет delete collection одним вызовом — делаем батчами.
-        """
-        # 1) delete transactions in batches
-        col = self.tx_col(user_id)
-        while True:
-            docs = col.limit(300).get()
-            if not docs:
-                break
-            batch = self.db.batch()
-            for d in docs:
-                batch.delete(d.reference)
-            batch.commit()
+    def get_last_transaction(self, user_id: int) -> Optional[Tuple[str, Dict[str, Any]]]:
+        q = self.tx_col(user_id).order_by("ts", direction=firestore.Query.DESCENDING).limit(1).get()
+        if not q:
+            return None
+        doc = q[0]
+        return doc.id, (doc.to_dict() or {})
 
-        # (на будущее: здесь же будут obligations, debts, goals, limits, assets, reminders)
-        # пока чистим только transactions + user doc
-        self.user_ref(user_id).delete()
+    def delete_last_transaction(self, user_id: int) -> bool:
+        last = self.get_last_transaction(user_id)
+        if not last:
+            return False
+        doc_id, _ = last
+        self.tx_col(user_id).document(doc_id).delete()
+        return True
 
-    # --------------- Queries / summaries ---------------
-    def query_transactions(self, user_id: int, d1: date, d2: date) -> List[Dict[str, Any]]:
-        start_dt = datetime.combine(d1, time(0, 0, 0))
-        end_dt = datetime.combine(d2, time(23, 59, 59))
+    def list_transactions(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        q = self.tx_col(user_id).order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).get()
+        out = []
+        for d in q:
+            item = d.to_dict() or {}
+            item["_id"] = d.id
+            out.append(item)
+        return out
 
+    # For reporting we fetch by ts range (simple).
+    # NOTE: Firestore "ts" is server timestamp. That’s OK for MVP.
+    def query_by_ts_range(self, user_id: int, start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
         q = (
             self.tx_col(user_id)
             .where("ts", ">=", start_dt)
@@ -109,46 +122,60 @@ class Storage:
             .order_by("ts", direction=firestore.Query.ASCENDING)
             .get()
         )
-
-        out: List[Dict[str, Any]] = []
-        for doc in q:
-            item = doc.to_dict() or {}
-            item["_id"] = doc.id
+        out = []
+        for d in q:
+            item = d.to_dict() or {}
+            item["_id"] = d.id
             out.append(item)
         return out
 
-    def summarize(self, user_id: int, d1: date, d2: date, category: Optional[str] = None) -> Dict[str, Any]:
-        items = self.query_transactions(user_id, d1, d2)
+    # -----------------------------
+    # delete account with cooldown
+    # -----------------------------
+    def can_delete_account_now(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
+        doc = self.delete_cooldown_ref(user_id).get()
+        if not doc.exists:
+            return True, None
+        data = doc.to_dict() or {}
+        until = data.get("cooldown_until")
+        if not until:
+            return True, None
 
-        income = 0.0
-        expense = 0.0
-        by_cat: Dict[str, float] = {}
+        # until may be Firestore Timestamp -> has .to_datetime()
+        try:
+            until_dt = until.to_datetime()
+        except Exception:
+            until_dt = None
 
-        for tx in items:
-            ttype = (tx.get("type") or "expense").lower()
-            amt = float(tx.get("amount") or 0.0)
-            cat = (tx.get("category") or "other").strip()
+        if not until_dt:
+            return True, None
 
-            if category and category != "all":
-                # очень простой фильтр: точное совпадение
-                if cat.lower() != category.lower():
-                    continue
+        now = datetime.now(timezone.utc)
+        if now >= until_dt:
+            return True, None
+        return False, until_dt
 
-            if ttype == "income":
-                income += amt
-            else:
-                expense += amt
+    def set_delete_cooldown(self, user_id: int, hours: int = 24) -> None:
+        now = datetime.now(timezone.utc)
+        until = now + timedelta(hours=hours)
+        self.delete_cooldown_ref(user_id).set(
+            {"cooldown_until": until, "updated_at": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
 
-            by_cat[cat] = by_cat.get(cat, 0.0) + amt
+    def delete_account_everything(self, user_id: int) -> None:
+        # delete subcollections in batches
+        self._delete_collection_in_batches(self.tx_col(user_id), batch_size=300)
 
-        net = income - expense
-        top = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)[:5]
+        # user doc
+        self.user_ref(user_id).delete()
 
-        return {
-            "income": income,
-            "expense": expense,
-            "net": net,
-            "top_categories": top,
-            "count": len(items),
-        }
-
+    def _delete_collection_in_batches(self, col_ref, batch_size: int = 300) -> None:
+        while True:
+            docs = col_ref.limit(batch_size).get()
+            if not docs:
+                break
+            batch = self.db.batch()
+            for d in docs:
+                batch.delete(d.reference)
+            batch.commit()
