@@ -1,110 +1,97 @@
 import os
-import logging
+import json
+import tempfile
+
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+import firebase_admin
+from firebase_admin import credentials, firestore
 from openai import OpenAI
 
-# =========================
-# BASIC SETUP
-# =========================
-logging.basicConfig(level=logging.INFO)
+from brain import Brain
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
+if not FIREBASE_SERVICE_ACCOUNT:
+    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT is missing")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-# =========================
-# SIMPLE MEMORY (TEMP)
-# =========================
-USER_STATE = {}
+openai_client = OpenAI()
 
-# =========================
-# HELPERS
-# =========================
-def get_lang(text: str) -> str:
-    text = text.lower()
-    if any(w in text for w in ["привет", "кофе", "покажи", "расход", "доход"]):
-        return "ru"
-    return "en"
+brain = Brain(db=db, openai_client=openai_client)
 
-def human_reply(lang: str) -> str:
-    if lang == "ru":
-        return "Привет 🙂 Что будем делать? Записать расход, доход, посмотреть сводку или обсудить идею?"
-    return "Hi 🙂 What would you like to do? Add an expense, income, get a summary or advice?"
 
-# =========================
-# OPENAI CALL
-# =========================
-def ask_openai(user_text: str, lang: str) -> str:
+async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    voice = update.message.voice
+    tg_file = await context.bot.get_file(voice.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        tmp_path = tmp.name
+
     try:
-        resp = openai_client.responses.create(
-            model="gpt-4o-mini",
-            instructions=(
-                "You are a finance notebook assistant. "
-                "You respond like a human, short, clear, no philosophy. "
-                "Stay within finance, budgeting, money notes."
-            ),
-            input=user_text,
-        )
+        await tg_file.download_to_drive(custom_path=tmp_path)
+        with open(tmp_path, "rb") as f:
+            tr = openai_client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f,
+            )
+        text = getattr(tr, "text", None)
+        return (text or "").strip()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
 
-        return "Не смог сформировать ответ."
-
-    except Exception as e:
-        # 🔥 ВОТ ГЛАВНОЕ
-        print("OPENAI ERROR >>>", repr(e))
-        return (
-            "Сейчас не могу обратиться к OpenAI. "
-            "Посмотри логи Railway — там есть точная ошибка."
-            if lang == "ru"
-            else "Can't reach OpenAI right now. Check Railway logs for details."
-        )
-
-# =========================
-# HANDLERS
-# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(update.message.text or "")
-    await update.message.reply_text(human_reply(lang))
+    user = update.effective_user
+    # Just greet. No currency trap.
+    reply = "Привет 🙂 Я твоя финансовая записная книжка. Что хочешь сделать: записать расход/доход, посмотреть сводку или спросить совет?"
+    await update.message.reply_text(reply)
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    lang = get_lang(text)
+    reply = brain.handle(user.id, user.username, user.first_name, text)
+    await update.message.reply_text(reply)
 
-    # Простые приветствия — БЕЗ OpenAI
-    if text.lower() in ["привет", "куку", "ау", "hello", "hi"]:
-        await update.message.reply_text(human_reply(lang))
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    try:
+        text = await transcribe_telegram_voice(update, context)
+    except Exception as e:
+        await update.message.reply_text("Не смог распознать голос. Попробуй ещё раз.")
+        print("STT error:", repr(e))
         return
 
-    # Всё остальное — через OpenAI
-    answer = ask_openai(text, lang)
-    await update.message.reply_text(answer)
+    if not text:
+        await update.message.reply_text("Не разобрал голос. Попробуй ещё раз.")
+        return
 
-# =========================
-# APP
-# =========================
+    reply = brain.handle(user.id, user.username, user.first_name, text)
+    await update.message.reply_text(reply)
+
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
-
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-print("Bot is running...")
+print("Bot started")
 app.run_polling()
