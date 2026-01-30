@@ -1,83 +1,102 @@
 import json
-from typing import Any, Dict, Optional
+import re
+from openai import OpenAI
 
 
-SYSTEM_INSTRUCTIONS = """You are a finance-notebook assistant inside a Telegram bot.
-Rules:
-- Always respond in the same language as the user's message.
-- Do NOT engage in long off-topic chats. If user is off-topic, answer briefly and steer back to finance tasks.
-- Be flexible like a human assistant. Never "block" conversation just because settings are missing.
-- Only ask for missing base currency when user wants calculations or to save an amount.
-- Output MUST be valid JSON following the schema below. No markdown.
+def _safe_json_extract(text: str) -> dict | None:
+    """
+    Пытаемся достать JSON даже если модель добавила лишний текст.
+    """
+    if not text:
+        return None
 
-Schema (JSON object):
-{
-  "action": "greet|help|offtopic|add_transaction|query_summary|query_list|advice|set_language|set_currency|delete_account|unknown",
-  "reply": "string (assistant reply to user, same language as user)",
-  "detected_language": "string (e.g., ru, en, de, es, ...)",
-  "language_set": "string|null (if user asked to change language)",
-  "base_currency_set": "string|null (if user set currency like USD)",
-  "transaction": {
-     "type": "expense|income",
-     "amount": number|null,
-     "category": "string|null",
-     "note": "string|null"
-  },
-  "period": {
-     "type": "day|week|month|year|custom",
-     "from": "YYYY-MM-DD|null",
-     "to": "YYYY-MM-DD|null"
-  }
-}
+    # ищем первый {...}
+    m = re.search(r"\{.*\}", text, flags=re.S)
+    if not m:
+        return None
 
-Notes:
-- For add_transaction: if user says "coffee 5" => expense, amount 5, category "coffee" or "food".
-- If user explicitly says income ("got paid", "salary", "пришло") => income.
-- For queries like "my expenses last week" => query_summary OR query_list depending on wording. Summary by default.
-- If user says "show list" => query_list.
-- If user says "delete my account" / "удали аккаунт/всё" => delete_account.
-- If user says "change language to ..." => set_language and language_set.
-- If user says "currency USD" => set_currency and base_currency_set.
-"""
+    chunk = m.group(0)
+    try:
+        return json.loads(chunk)
+    except Exception:
+        return None
 
 
-def route_message(openai_client: Any, prefs: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    # We keep it cheap: one call.
-    # If OpenAI fails, caller will fallback.
+def route_message(openai_client: OpenAI, user_text: str, lang: str, currency: str | None, user_name: str | None) -> dict:
+    """
+    Возвращает структуру:
+    {
+      "intent": "greeting|record|summary|advice|set_language|set_currency|delete_account|other",
+      "reply": "text in user's language",
+      "record": { "type":"expense|income", "amount": 12.3, "category":"food", "note":"coffee" } | null,
+      "summary": { "period":"week|month|day|year", "kind":"expenses|income|all" } | null,
+      "set": { "language":"ru" } | { "currency":"USD" } | null,
+      "needs": { "currency": true/false }   # если для действия нужна валюта
+    }
+    """
+
+    sys = (
+        "You are a finance notebook assistant inside a Telegram bot.\n"
+        "Rules:\n"
+        "- Stay inside finance notebook scope (records, summaries, advice, reminders conceptually).\n"
+        "- If user asks about weather/politics/random, politely redirect back to finance tasks.\n"
+        "- Always respond in user's language.\n"
+        "- Output ONLY valid JSON. No markdown. No extra text.\n"
+        "\n"
+        "If user message is a greeting (hi/привет/куку/ау), intent=greeting.\n"
+        "If user wants to record something like 'coffee 5', intent=record.\n"
+        "If user asks 'my expenses last week', intent=summary.\n"
+        "If user says 'speak Russian / по-русски', intent=set_language.\n"
+        "If user says 'currency USD / валюта рубли', intent=set_currency.\n"
+        "If user says 'delete my account / удали всё', intent=delete_account.\n"
+        "\n"
+        "Categories (suggest one): food, fuel, car, health, home, debt, entertainment, other.\n"
+        "Amounts: number only.\n"
+    )
+
+    # язык
+    if lang in ["auto", None, ""]:
+        lang = "ru"
+
+    user_context = {
+        "user_name": user_name,
+        "language": lang,
+        "currency": currency,
+    }
+
+    prompt = {
+        "user_context": user_context,
+        "message": user_text
+    }
 
     resp = openai_client.responses.create(
         model="gpt-4o-mini",
-        instructions=SYSTEM_INSTRUCTIONS,
-        input=f"User prefs: {json.dumps(prefs, ensure_ascii=False)}\nUser message: {user_text}",
-        # JSON mode: enforce structured output
-        response_format={"type": "json_object"},
+        instructions=sys,
+        input=json.dumps(prompt, ensure_ascii=False),
     )
 
-    txt = getattr(resp, "output_text", "") or ""
-    txt = txt.strip()
+    out = getattr(resp, "output_text", "") or ""
+    data = _safe_json_extract(out)
 
-    data: Dict[str, Any] = {}
-    try:
-        data = json.loads(txt)
-    except Exception:
-        # Hard fallback if model returned non-JSON
+    # fallback, если модель вдруг вернула не-JSON
+    if not isinstance(data, dict):
         data = {
-            "action": "unknown",
-            "reply": "",
-            "detected_language": None,
-            "language_set": None,
-            "base_currency_set": None,
-            "transaction": {"type": None, "amount": None, "category": None, "note": None},
-            "period": {"type": None, "from": None, "to": None},
+            "intent": "other",
+            "reply": ("Я тебя понял. Что хочешь сделать: записать расход/доход, получить сводку или совет?"
+                      if lang.startswith("ru")
+                      else "Got it. What would you like to do: record expense/income, get a summary, or advice?"),
+            "record": None,
+            "summary": None,
+            "set": None,
+            "needs": {"currency": False},
         }
 
-    # Normalize fields
-    data.setdefault("action", "unknown")
+    # нормализуем поля
+    data.setdefault("intent", "other")
     data.setdefault("reply", "")
-    data.setdefault("detected_language", None)
-    data.setdefault("language_set", None)
-    data.setdefault("base_currency_set", None)
-    data.setdefault("transaction", {"type": None, "amount": None, "category": None, "note": None})
-    data.setdefault("period", {"type": None, "from": None, "to": None})
+    data.setdefault("record", None)
+    data.setdefault("summary", None)
+    data.setdefault("set", None)
+    data.setdefault("needs", {"currency": False})
 
     return data
