@@ -1,125 +1,83 @@
-from __future__ import annotations
+import json
+from typing import Any, Dict, Optional
 
-from typing import Any, Dict
 
-ROUTER_MODEL = "gpt-4o-mini"
+SYSTEM_INSTRUCTIONS = """You are a finance-notebook assistant inside a Telegram bot.
+Rules:
+- Always respond in the same language as the user's message.
+- Do NOT engage in long off-topic chats. If user is off-topic, answer briefly and steer back to finance tasks.
+- Be flexible like a human assistant. Never "block" conversation just because settings are missing.
+- Only ask for missing base currency when user wants calculations or to save an amount.
+- Output MUST be valid JSON following the schema below. No markdown.
+
+Schema (JSON object):
+{
+  "action": "greet|help|offtopic|add_transaction|query_summary|query_list|advice|set_language|set_currency|delete_account|unknown",
+  "reply": "string (assistant reply to user, same language as user)",
+  "detected_language": "string (e.g., ru, en, de, es, ...)",
+  "language_set": "string|null (if user asked to change language)",
+  "base_currency_set": "string|null (if user set currency like USD)",
+  "transaction": {
+     "type": "expense|income",
+     "amount": number|null,
+     "category": "string|null",
+     "note": "string|null"
+  },
+  "period": {
+     "type": "day|week|month|year|custom",
+     "from": "YYYY-MM-DD|null",
+     "to": "YYYY-MM-DD|null"
+  }
+}
+
+Notes:
+- For add_transaction: if user says "coffee 5" => expense, amount 5, category "coffee" or "food".
+- If user explicitly says income ("got paid", "salary", "пришло") => income.
+- For queries like "my expenses last week" => query_summary OR query_list depending on wording. Summary by default.
+- If user says "show list" => query_list.
+- If user says "delete my account" / "удали аккаунт/всё" => delete_account.
+- If user says "change language to ..." => set_language and language_set.
+- If user says "currency USD" => set_currency and base_currency_set.
+"""
 
 
 def route_message(openai_client: Any, prefs: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    """
-    Single LLM router: decides what the user meant in the context of the finance notebook.
-    Returns a strict JSON object matching the schema below.
-    """
-
-    schema = {
-        "name": "finance_notebook_router",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "greet",
-                        "help",
-                        "set_language",
-                        "set_currency",
-                        "add_transaction",
-                        "query_summary",
-                        "query_list",
-                        "add_reminder",
-                        "delete_account",
-                        "offtopic",
-                        "unknown",
-                    ],
-                },
-                "reply": {"type": "string"},
-                "language_set": {"type": ["string", "null"], "description": "BCP-47 if possible (e.g., en, ru, de, fr, es)."},
-                "base_currency_set": {"type": ["string", "null"], "description": "ISO code like USD/EUR/GBP."},
-                "period": {
-                    "type": ["object", "null"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "type": {"type": "string", "enum": ["day", "week", "month", "year", "custom"]},
-                        "start_iso": {"type": ["string", "null"]},
-                        "end_iso": {"type": ["string", "null"]},
-                    },
-                },
-                "transaction": {
-                    "type": ["object", "null"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "type": {"type": ["string", "null"], "enum": ["expense", "income", None]},
-                        "amount": {"type": ["number", "null"]},
-                        "category": {"type": ["string", "null"]},
-                        "note": {"type": ["string", "null"]},
-                    },
-                },
-                "reminder": {
-                    "type": ["object", "null"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "when_iso": {"type": ["string", "null"], "description": "UTC ISO datetime."},
-                        "text": {"type": ["string", "null"]},
-                    },
-                },
-            },
-            "required": ["action", "reply", "language_set", "base_currency_set", "period", "transaction", "reminder"],
-        },
-    }
-
-    instructions = (
-        "You are an intent router for a finance notebook bot.\n"
-        "Rules:\n"
-        "- Stay strictly in the finance notebook app context.\n"
-        "- If user is off-topic (politics, jokes, random chat), set action='offtopic' and reply briefly redirecting.\n"
-        "- If user says hello/hi, set action='greet' and reply politely + ask what to do.\n"
-        "- If user wants to change language: action='set_language' and language_set to the requested language.\n"
-        "- If user wants to change currency or says 'USD/EUR...' as answer: action='set_currency' and base_currency_set.\n"
-        "- If user provides a transaction like 'coffee 5' or 'spent 20 on gas': action='add_transaction' and fill transaction fields.\n"
-        "- If user asks for totals/summaries: action='query_summary' and period (week/month/year/custom if specified).\n"
-        "- If user asks to show the list/details: action='query_list' and period.\n"
-        "- If user sets a reminder: action='add_reminder' and reminder.when_iso in UTC ISO format.\n"
-        "- If user asks to delete everything/account: action='delete_account'.\n"
-        "- Always produce a helpful reply in the user's language.\n"
-        "- If you are not sure, ask ONE short clarification question in reply and set action='unknown'.\n"
-        "\n"
-        f"User preferences: language={prefs.get('language','auto')}, base_currency={prefs.get('base_currency')}\n"
-        "If language is auto, detect from the user's message and set language_set.\n"
-        "If base_currency is missing and user seems to specify currency, set base_currency_set.\n"
-    )
+    # We keep it cheap: one call.
+    # If OpenAI fails, caller will fallback.
 
     resp = openai_client.responses.create(
-        model=ROUTER_MODEL,
-        instructions=instructions,
-        input=user_text,
-        response_format={"type": "json_schema", "json_schema": schema},
+        model="gpt-4o-mini",
+        instructions=SYSTEM_INSTRUCTIONS,
+        input=f"User prefs: {json.dumps(prefs, ensure_ascii=False)}\nUser message: {user_text}",
+        # JSON mode: enforce structured output
+        response_format={"type": "json_object"},
     )
 
-    txt = getattr(resp, "output_text", None)
-    if not txt:
-        # fallback
-        return {
-            "action": "unknown",
-            "reply": "I’m not sure. Do you want to add an expense/income, or see a summary?",
-            "language_set": None,
-            "base_currency_set": None,
-            "period": None,
-            "transaction": None,
-            "reminder": None,
-        }
+    txt = getattr(resp, "output_text", "") or ""
+    txt = txt.strip()
 
-    import json
+    data: Dict[str, Any] = {}
     try:
         data = json.loads(txt)
-        return data
     except Exception:
-        return {
+        # Hard fallback if model returned non-JSON
+        data = {
             "action": "unknown",
-            "reply": "I’m not sure. Do you want to add an expense/income, or see a summary?",
+            "reply": "",
+            "detected_language": None,
             "language_set": None,
             "base_currency_set": None,
-            "period": None,
-            "transaction": None,
-            "reminder": None,
+            "transaction": {"type": None, "amount": None, "category": None, "note": None},
+            "period": {"type": None, "from": None, "to": None},
         }
+
+    # Normalize fields
+    data.setdefault("action", "unknown")
+    data.setdefault("reply", "")
+    data.setdefault("detected_language", None)
+    data.setdefault("language_set", None)
+    data.setdefault("base_currency_set", None)
+    data.setdefault("transaction", {"type": None, "amount": None, "category": None, "note": None})
+    data.setdefault("period", {"type": None, "from": None, "to": None})
+
+    return data
