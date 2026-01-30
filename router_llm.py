@@ -1,102 +1,93 @@
-import json
 import re
+from typing import Any, Dict, Optional
+
 from openai import OpenAI
 
 
-def _safe_json_extract(text: str) -> dict | None:
-    """
-    Пытаемся достать JSON даже если модель добавила лишний текст.
-    """
-    if not text:
-        return None
+SYSTEM_INSTRUCTIONS = """
+You are a conversational finance notebook bot inside Telegram.
 
-    # ищем первый {...}
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m:
-        return None
+Goals:
+- Always respond (never hang).
+- Operate within finance notebook scope: record income/expense, show summaries, reminders, advice.
+- If user is off-topic, gently redirect to finance.
 
-    chunk = m.group(0)
-    try:
-        return json.loads(chunk)
-    except Exception:
-        return None
+Language:
+- Reply in the same language as the user.
+- If user asks to change language, comply and confirm.
 
+Behavior:
+- If user greets: greet back and ask what they want to do.
+- If user message can be a finance record or query, decide and act.
 
-def route_message(openai_client: OpenAI, user_text: str, lang: str, currency: str | None, user_name: str | None) -> dict:
-    """
-    Возвращает структуру:
-    {
-      "intent": "greeting|record|summary|advice|set_language|set_currency|delete_account|other",
-      "reply": "text in user's language",
-      "record": { "type":"expense|income", "amount": 12.3, "category":"food", "note":"coffee" } | null,
-      "summary": { "period":"week|month|day|year", "kind":"expenses|income|all" } | null,
-      "set": { "language":"ru" } | { "currency":"USD" } | null,
-      "needs": { "currency": true/false }   # если для действия нужна валюта
-    }
-    """
+IMPORTANT:
+Return ONLY valid JSON object.
+No markdown.
+"""
 
-    sys = (
-        "You are a finance notebook assistant inside a Telegram bot.\n"
-        "Rules:\n"
-        "- Stay inside finance notebook scope (records, summaries, advice, reminders conceptually).\n"
-        "- If user asks about weather/politics/random, politely redirect back to finance tasks.\n"
-        "- Always respond in user's language.\n"
-        "- Output ONLY valid JSON. No markdown. No extra text.\n"
-        "\n"
-        "If user message is a greeting (hi/привет/куку/ау), intent=greeting.\n"
-        "If user wants to record something like 'coffee 5', intent=record.\n"
-        "If user asks 'my expenses last week', intent=summary.\n"
-        "If user says 'speak Russian / по-русски', intent=set_language.\n"
-        "If user says 'currency USD / валюта рубли', intent=set_currency.\n"
-        "If user says 'delete my account / удали всё', intent=delete_account.\n"
-        "\n"
-        "Categories (suggest one): food, fuel, car, health, home, debt, entertainment, other.\n"
-        "Amounts: number only.\n"
-    )
+# Router output schema:
+# {
+#   "intent": "chat"|"record_event"|"summary"|"set_language"|"set_currency"|"delete_account"|"help",
+#   "reply": "string",
+#   "event": {"kind":"expense|income","amount":123.45,"currency":null|"...","category":null|"...","note":null|"..."} | null,
+#   "summary": {"period":"week|month|day|custom","kind":"all|expense|income","category":null|"..."} | null,
+#   "set": {"language": "ru|en|de|..."} | {"currency":"USD"} | null,
+#   "delete_confirm": true|false
+# }
 
-    # язык
-    if lang in ["auto", None, ""]:
-        lang = "ru"
+def call_router(
+    client: OpenAI,
+    user_text: str,
+    user_settings: Dict[str, Any],
+    pending: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    lang = (user_settings or {}).get("language")
+    currency = (user_settings or {}).get("currency")
 
-    user_context = {
-        "user_name": user_name,
-        "language": lang,
-        "currency": currency,
+    context = {
+        "known_language": lang,
+        "known_currency": currency,
+        "pending": pending,
     }
 
-    prompt = {
-        "user_context": user_context,
-        "message": user_text
-    }
-
-    resp = openai_client.responses.create(
+    resp = client.responses.create(
         model="gpt-4o-mini",
-        instructions=sys,
-        input=json.dumps(prompt, ensure_ascii=False),
+        instructions=SYSTEM_INSTRUCTIONS,
+        input=[
+            {"role": "user", "content": f"USER_SETTINGS_AND_STATE: {context}\n\nUSER_MESSAGE: {user_text}"}
+        ],
+        response_format={"type": "json_object"},
     )
+    txt = getattr(resp, "output_text", None)
+    if not txt:
+        return {"intent": "help", "reply": "I had trouble. Try again.", "event": None, "summary": None, "set": None}
 
-    out = getattr(resp, "output_text", "") or ""
-    data = _safe_json_extract(out)
+    # safety: ensure dict
+    import json
+    try:
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
 
-    # fallback, если модель вдруг вернула не-JSON
-    if not isinstance(data, dict):
-        data = {
-            "intent": "other",
-            "reply": ("Я тебя понял. Что хочешь сделать: записать расход/доход, получить сводку или совет?"
-                      if lang.startswith("ru")
-                      else "Got it. What would you like to do: record expense/income, get a summary, or advice?"),
-            "record": None,
-            "summary": None,
-            "set": None,
-            "needs": {"currency": False},
-        }
+    return {"intent": "help", "reply": "I had trouble. Try again.", "event": None, "summary": None, "set": None}
 
-    # нормализуем поля
-    data.setdefault("intent", "other")
-    data.setdefault("reply", "")
-    data.setdefault("record", None)
-    data.setdefault("summary", None)
-    data.setdefault("set", None)
-    data.setdefault("needs", {"currency": False})
 
-    return data
+def normalize_currency(s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip().upper()
+    if re.fullmatch(r"[A-Z]{3}", s):
+        return s
+    return None
+
+
+def normalize_language_code(s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip().lower()
+    # accept things like "ru", "en", "de", "es", "fr", "pt-br"
+    if re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", s):
+        return s
+    return None
