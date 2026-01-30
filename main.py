@@ -20,14 +20,31 @@ if not BOT_TOKEN:
 if not FIREBASE_SERVICE_ACCOUNT:
     raise RuntimeError("FIREBASE_SERVICE_ACCOUNT is missing")
 
+# Optional but highly recommended: make OpenAI errors obvious in logs
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY is missing. OpenAI features (LLM/STT) will fail.")
 
 cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-openai_client = OpenAI()
+openai_client = OpenAI()  # uses OPENAI_API_KEY env internally
 
 brain = Brain(db=db, openai_client=openai_client)
+
+
+async def post_init(app):
+    """
+    IMPORTANT:
+    This prevents telegram.error.Conflict (getUpdates terminated by other request)
+    by deleting any webhook and dropping pending updates at startup.
+    """
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook deleted (drop_pending_updates=True)")
+    except Exception as e:
+        print("delete_webhook error:", repr(e))
 
 
 async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -54,9 +71,10 @@ async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAUL
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # Just greet. No currency trap.
-    reply = "Привет 🙂 Я твоя финансовая записная книжка. Что хочешь сделать: записать расход/доход, посмотреть сводку или спросить совет?"
+    reply = (
+        "Привет 🙂 Я твоя финансовая записная книжка.\n"
+        "Что хочешь сделать: записать расход/доход, посмотреть сводку или спросить совет?"
+    )
     await update.message.reply_text(reply)
 
 
@@ -66,7 +84,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    reply = brain.handle(user.id, user.username, user.first_name, text)
+    try:
+        reply = brain.handle(user.id, user.username, user.first_name, text)
+    except Exception as e:
+        # IMPORTANT: show real error in Railway logs instead of hiding it
+        print("Brain.handle error:", repr(e))
+        await update.message.reply_text("Ошибка обработки. Посмотри логи в Railway.")
+        return
+
     await update.message.reply_text(reply)
 
 
@@ -76,22 +101,37 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await transcribe_telegram_voice(update, context)
     except Exception as e:
-        await update.message.reply_text("Не смог распознать голос. Попробуй ещё раз.")
+        # IMPORTANT: show real error in Railway logs
         print("STT error:", repr(e))
+        await update.message.reply_text("Не смог распознать голос. Попробуй ещё раз.")
         return
 
     if not text:
         await update.message.reply_text("Не разобрал голос. Попробуй ещё раз.")
         return
 
-    reply = brain.handle(user.id, user.username, user.first_name, text)
+    try:
+        reply = brain.handle(user.id, user.username, user.first_name, text)
+    except Exception as e:
+        print("Brain.handle error (voice):", repr(e))
+        await update.message.reply_text("Ошибка обработки. Посмотри логи в Railway.")
+        return
+
     await update.message.reply_text(reply)
 
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .post_init(post_init)  # <-- KEY FIX for Conflict/getUpdates
+    .build()
+)
+
 app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
 print("Bot started")
-app.run_polling()
+
+# drop_pending_updates=True дополнительно помогает не ловить старые апдейты при рестарте
+app.run_polling(drop_pending_updates=True)
