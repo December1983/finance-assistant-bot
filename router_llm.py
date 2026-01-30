@@ -1,98 +1,125 @@
-import json
-from openai import OpenAI
+from __future__ import annotations
 
-client = OpenAI()
+from typing import Any, Dict
 
-ROUTER_INSTRUCTIONS = """
-You are the router for a conversational finance notebook bot.
-Return ONLY valid JSON that matches the schema. No extra text.
+ROUTER_MODEL = "gpt-4o-mini"
 
-The user can write in any language.
-You must:
-1) Detect the language of the user message (ISO code like "ru", "en", "de", "es", "pt-BR"...).
-2) Decide exactly ONE intent.
-3) Extract structured fields (amount, currency, category, period, dates, etc.) when possible.
 
-Intents:
-- set_base_currency: user sets preferred base currency (USD/EUR/etc.)
-- set_language: user explicitly requests to switch language or return to auto mode
-- log_expense: user reports spending
-- log_income: user reports income
-- show_summary: totals for a period (day/week/month/year/custom)
-- show_category: totals by category for a period
-- show_list: list last N records / records in period
-- delete_account: wipe ALL user data (requires confirmation phrase)
-- smalltalk: user message not about finance
-- unknown: cannot classify
+def route_message(openai_client: Any, prefs: Dict[str, Any], user_text: str) -> Dict[str, Any]:
+    """
+    Single LLM router: decides what the user meant in the context of the finance notebook.
+    Returns a strict JSON object matching the schema below.
+    """
 
-Rules:
-- Never invent amounts/dates. If unclear, set needs_clarification=true with ONE short question.
-- Default currency: null if not specified (the app will fill base currency).
-- Category should be a short key: food, fuel, car, rent, utilities, insurance, phone, health, shopping, subscriptions, entertainment, debt, other.
-- delete_account: if user is requesting deletion but not confirming, set args.confirm=false and ask for confirmation phrase:
-  "DELETE MY ACCOUNT" (exact).
-  If the user message contains that exact phrase, set args.confirm=true.
-"""
-
-JSON_SCHEMA = {
-    "name": "finance_router",
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "language": {"type": "string"},
-            "intent": {
-                "type": "string",
-                "enum": [
-                    "set_base_currency",
-                    "set_language",
-                    "log_expense",
-                    "log_income",
-                    "show_summary",
-                    "show_category",
-                    "show_list",
-                    "delete_account",
-                    "smalltalk",
-                    "unknown",
-                ],
+    schema = {
+        "name": "finance_notebook_router",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "greet",
+                        "help",
+                        "set_language",
+                        "set_currency",
+                        "add_transaction",
+                        "query_summary",
+                        "query_list",
+                        "add_reminder",
+                        "delete_account",
+                        "offtopic",
+                        "unknown",
+                    ],
+                },
+                "reply": {"type": "string"},
+                "language_set": {"type": ["string", "null"], "description": "BCP-47 if possible (e.g., en, ru, de, fr, es)."},
+                "base_currency_set": {"type": ["string", "null"], "description": "ISO code like USD/EUR/GBP."},
+                "period": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {"type": "string", "enum": ["day", "week", "month", "year", "custom"]},
+                        "start_iso": {"type": ["string", "null"]},
+                        "end_iso": {"type": ["string", "null"]},
+                    },
+                },
+                "transaction": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "type": {"type": ["string", "null"], "enum": ["expense", "income", None]},
+                        "amount": {"type": ["number", "null"]},
+                        "category": {"type": ["string", "null"]},
+                        "note": {"type": ["string", "null"]},
+                    },
+                },
+                "reminder": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "when_iso": {"type": ["string", "null"], "description": "UTC ISO datetime."},
+                        "text": {"type": ["string", "null"]},
+                    },
+                },
             },
-            "args": {"type": "object"},
-            "needs_clarification": {"type": "boolean"},
-            "clarifying_question": {"type": "string"},
+            "required": ["action", "reply", "language_set", "base_currency_set", "period", "transaction", "reminder"],
         },
-        "required": ["language", "intent", "args", "needs_clarification", "clarifying_question"],
-    },
-}
-
-
-def route_message(user_text: str) -> dict:
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        instructions=ROUTER_INSTRUCTIONS,
-        input=user_text,
-        response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
-    )
-    raw = resp.output_text or "{}"
-    try:
-        obj = json.loads(raw)
-        # basic safety
-        if not isinstance(obj, dict):
-            return _fallback()
-        for k in ["language", "intent", "args", "needs_clarification", "clarifying_question"]:
-            if k not in obj:
-                return _fallback()
-        if not isinstance(obj["args"], dict):
-            obj["args"] = {}
-        return obj
-    except Exception:
-        return _fallback()
-
-
-def _fallback() -> dict:
-    return {
-        "language": "en",
-        "intent": "unknown",
-        "args": {},
-        "needs_clarification": True,
-        "clarifying_question": "I couldn't understand. Please rephrase in one sentence.",
     }
+
+    instructions = (
+        "You are an intent router for a finance notebook bot.\n"
+        "Rules:\n"
+        "- Stay strictly in the finance notebook app context.\n"
+        "- If user is off-topic (politics, jokes, random chat), set action='offtopic' and reply briefly redirecting.\n"
+        "- If user says hello/hi, set action='greet' and reply politely + ask what to do.\n"
+        "- If user wants to change language: action='set_language' and language_set to the requested language.\n"
+        "- If user wants to change currency or says 'USD/EUR...' as answer: action='set_currency' and base_currency_set.\n"
+        "- If user provides a transaction like 'coffee 5' or 'spent 20 on gas': action='add_transaction' and fill transaction fields.\n"
+        "- If user asks for totals/summaries: action='query_summary' and period (week/month/year/custom if specified).\n"
+        "- If user asks to show the list/details: action='query_list' and period.\n"
+        "- If user sets a reminder: action='add_reminder' and reminder.when_iso in UTC ISO format.\n"
+        "- If user asks to delete everything/account: action='delete_account'.\n"
+        "- Always produce a helpful reply in the user's language.\n"
+        "- If you are not sure, ask ONE short clarification question in reply and set action='unknown'.\n"
+        "\n"
+        f"User preferences: language={prefs.get('language','auto')}, base_currency={prefs.get('base_currency')}\n"
+        "If language is auto, detect from the user's message and set language_set.\n"
+        "If base_currency is missing and user seems to specify currency, set base_currency_set.\n"
+    )
+
+    resp = openai_client.responses.create(
+        model=ROUTER_MODEL,
+        instructions=instructions,
+        input=user_text,
+        response_format={"type": "json_schema", "json_schema": schema},
+    )
+
+    txt = getattr(resp, "output_text", None)
+    if not txt:
+        # fallback
+        return {
+            "action": "unknown",
+            "reply": "I’m not sure. Do you want to add an expense/income, or see a summary?",
+            "language_set": None,
+            "base_currency_set": None,
+            "period": None,
+            "transaction": None,
+            "reminder": None,
+        }
+
+    import json
+    try:
+        data = json.loads(txt)
+        return data
+    except Exception:
+        return {
+            "action": "unknown",
+            "reply": "I’m not sure. Do you want to add an expense/income, or see a summary?",
+            "language_set": None,
+            "base_currency_set": None,
+            "period": None,
+            "transaction": None,
+            "reminder": None,
+        }
