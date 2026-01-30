@@ -1,150 +1,110 @@
 import os
-import tempfile
 import logging
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     MessageHandler,
+    CommandHandler,
     ContextTypes,
     filters,
 )
-
 from openai import OpenAI
 
-from storage import Storage
-from brain import Brain
-
-
+# =========================
+# BASIC SETUP
+# =========================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("finance-notebook-bot")
-
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
-if not FIREBASE_SERVICE_ACCOUNT:
-    raise RuntimeError("FIREBASE_SERVICE_ACCOUNT is missing")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing")
 
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-storage = Storage(service_account_json=FIREBASE_SERVICE_ACCOUNT)
-brain = Brain(storage=storage, openai_client=openai_client)
 
+# =========================
+# SIMPLE MEMORY (TEMP)
+# =========================
+USER_STATE = {}
 
-async def transcribe_telegram_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    voice = update.message.voice
-    tg_file = await context.bot.get_file(voice.file_id)
+# =========================
+# HELPERS
+# =========================
+def get_lang(text: str) -> str:
+    text = text.lower()
+    if any(w in text for w in ["привет", "кофе", "покажи", "расход", "доход"]):
+        return "ru"
+    return "en"
 
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp_path = tmp.name
+def human_reply(lang: str) -> str:
+    if lang == "ru":
+        return "Привет 🙂 Что будем делать? Записать расход, доход, посмотреть сводку или обсудить идею?"
+    return "Hi 🙂 What would you like to do? Add an expense, income, get a summary or advice?"
 
+# =========================
+# OPENAI CALL
+# =========================
+def ask_openai(user_text: str, lang: str) -> str:
     try:
-        await tg_file.download_to_drive(custom_path=tmp_path)
-        with open(tmp_path, "rb") as f:
-            tr = openai_client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
-            )
-        text = getattr(tr, "text", "") or ""
-        return text.strip()
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_lang = getattr(user, "language_code", None)
-
-    try:
-        reply = await brain.handle(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            telegram_language_code=user_lang,
-            text="/start",
+        resp = openai_client.responses.create(
+            model="gpt-4o-mini",
+            instructions=(
+                "You are a finance notebook assistant. "
+                "You respond like a human, short, clear, no philosophy. "
+                "Stay within finance, budgeting, money notes."
+            ),
+            input=user_text,
         )
-        await update.message.reply_text(reply)
-    except Exception as e:
-        logger.exception("START error: %s", e)
-        await update.message.reply_text("Ошибка на сервере. Открой Railway Logs и пришли верхние 10 строк.")
 
+        if hasattr(resp, "output_text") and resp.output_text:
+            return resp.output_text.strip()
+
+        return "Не смог сформировать ответ."
+
+    except Exception as e:
+        # 🔥 ВОТ ГЛАВНОЕ
+        print("OPENAI ERROR >>>", repr(e))
+        return (
+            "Сейчас не могу обратиться к OpenAI. "
+            "Посмотри логи Railway — там есть точная ошибка."
+            if lang == "ru"
+            else "Can't reach OpenAI right now. Check Railway logs for details."
+        )
+
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update.message.text or "")
+    await update.message.reply_text(human_reply(lang))
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_lang = getattr(user, "language_code", None)
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    try:
-        reply = await brain.handle(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            telegram_language_code=user_lang,
-            text=text,
-        )
-        if reply:
-            await update.message.reply_text(reply)
-    except Exception as e:
-        logger.exception("TEXT error: %s", e)
-        await update.message.reply_text(
-            "Упало при обработке сообщения. Открой Railway Logs и пришли верхние 10 строк ошибки."
-        )
+    lang = get_lang(text)
 
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_lang = getattr(user, "language_code", None)
-
-    try:
-        text = await transcribe_telegram_voice(update, context)
-    except Exception as e:
-        logger.exception("STT error: %s", e)
-        await update.message.reply_text("Не смог распознать голос. Проверь OPENAI_API_KEY и баланс.")
+    # Простые приветствия — БЕЗ OpenAI
+    if text.lower() in ["привет", "куку", "ау", "hello", "hi"]:
+        await update.message.reply_text(human_reply(lang))
         return
 
-    if not text:
-        await update.message.reply_text("Не разобрал голос (пусто). Попробуй ещё раз.")
-        return
+    # Всё остальное — через OpenAI
+    answer = ask_openai(text, lang)
+    await update.message.reply_text(answer)
 
-    try:
-        reply = await brain.handle(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            telegram_language_code=user_lang,
-            text=text,
-        )
-        if reply:
-            await update.message.reply_text(reply)
-    except Exception as e:
-        logger.exception("VOICE error: %s", e)
-        await update.message.reply_text(
-            "Ошибка при обработке голоса. Открой Railway Logs и пришли верхние 10 строк."
-        )
+# =========================
+# APP
+# =========================
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-
-    logger.info("Bot started")
-    app.run_polling(close_loop=False)
-
-
-if __name__ == "__main__":
-    main()
+print("Bot is running...")
+app.run_polling()
