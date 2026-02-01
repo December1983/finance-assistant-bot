@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+openai==1.55.3
+firebase-admin==6.5.0
+python-dateutil==2.9.0.post0
